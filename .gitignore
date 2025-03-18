@@ -1,0 +1,7 @@
+*.onnx
+*.pth
+*.safetensors
+*.bin
+*.pyc
+*.zip
+.cache/
