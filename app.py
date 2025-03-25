@@ -377,12 +377,11 @@ def generate_image(
     # gc.collect()
 
     pipe.set_ip_adapter_scale(adapter_strength_ratio)
-    pipe.enable_sequential_cpu_offload()
-    # pipe.enable_model_cpu_offload()
+    # pipe.enable_sequential_cpu_offload()
+    pipe.enable_model_cpu_offload()
     print(pipe.device)
     print(pipe.controlnet.nets[0].device)
-    import time 
-    time.sleep(1000)
+
     images = pipe(
         prompt=prompt,
         negative_prompt=negative_prompt,
@@ -401,11 +400,11 @@ def generate_image(
 
 image = generate_image(
     "Untitled.png",
-    "Untitled.png",
-    prompt="hahah haha ahaha haha aha haha ah ",
-    negative_prompt="hahah haha ahaha haha aha haha ah ",
-    style_name = DEFAULT_STYLE_NAME,
-    num_steps = 30,
+    "pexels-cottonbro-6718544.jpg",
+    prompt="anime style, ghibli style",
+    negative_prompt="",
+    style_name = "(No style)",
+    num_steps = 20,
     identitynet_strength_ratio = 0.8,
     adapter_strength_ratio = 0.8,
     canny_strength = 0.4,

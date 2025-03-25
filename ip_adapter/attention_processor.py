@@ -185,9 +185,11 @@ class IPAttnProcessor(nn.Module):
                 h, w = region_mask.shape[:2]
                 ratio = (h * w / query.shape[1]) ** 0.5
                 mask = F.interpolate(region_mask[None, None], scale_factor=1/ratio, mode='nearest').reshape([1, -1, 1])
+                mask = mask.type_as(hidden_states)
                 mask = mask.to(ip_hidden_states.device)
+
             else:
-                mask = torch.ones_like(ip_hidden_states)
+                mask = torch.ones_like(ip_hidden_states, dtype=hidden_states.dtype)
             ip_hidden_states = ip_hidden_states * mask     
 
         hidden_states = hidden_states + self.scale * ip_hidden_states

@@ -45,6 +45,8 @@ from ip_adapter.utils import is_torch2_available
 
 from ip_adapter.attention_processor import IPAttnProcessor, AttnProcessor
 from ip_adapter.attention_processor import region_control
+# from diffusers.quantizers.bitsandbytes.utils import _check_bnb_status
+from offload_half import half_cpu_offload_with_hook
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
@@ -623,6 +625,8 @@ from diffusers.schedulers import KarrasDiffusionSchedulers
 
 class StableDiffusionXLInstantIDPipeline(StableDiffusionXLControlNetPipeline):
 
+    model_cpu_offload_seq = "unet"
+
     def __init__(
         self,
         vae: AutoencoderKL,
@@ -661,6 +665,10 @@ class StableDiffusionXLInstantIDPipeline(StableDiffusionXLControlNetPipeline):
 
         self.image_proj_model = image_proj_model
         __class__._optional_components.append("image_proj_model")
+
+
+        # self.unet = self.unet.half()
+
 
     def cuda(self, dtype=torch.float16, use_xformers=False):
         self.to("cuda", dtype)
@@ -848,7 +856,6 @@ class StableDiffusionXLInstantIDPipeline(StableDiffusionXLControlNetPipeline):
                 # are of type nn.Module
 
                 if isinstance(model, MultiControlNetModel):
-                    print("hehehehe", len(model.nets))
                     for idx_net in range(len(model.nets)):
                         net = model.nets[idx_net]
                         offload_buffers = len(net._parameters) > 0
@@ -857,6 +864,119 @@ class StableDiffusionXLInstantIDPipeline(StableDiffusionXLControlNetPipeline):
                 else:
                     offload_buffers = len(model._parameters) > 0
                     cpu_offload(model, device, offload_buffers=offload_buffers)
+
+    def enable_model_cpu_offload(self, gpu_id: Optional[int] = None, device: Union[torch.device, str] = "cuda"):
+        r"""
+        Offloads all models to CPU using accelerate, reducing memory usage with a low impact on performance. Compared
+        to `enable_sequential_cpu_offload`, this method moves one whole model at a time to the GPU when its `forward`
+        method is called, and the model remains in GPU until the next model runs. Memory savings are lower than with
+        `enable_sequential_cpu_offload`, but performance is much better due to the iterative execution of the `unet`.
+
+        Arguments:
+            gpu_id (`int`, *optional*):
+                The ID of the accelerator that shall be used in inference. If not specified, it will default to 0.
+            device (`torch.Device` or `str`, *optional*, defaults to "cuda"):
+                The PyTorch device type of the accelerator that shall be used in inference. If not specified, it will
+                default to "cuda".
+        """
+        is_pipeline_device_mapped = self.hf_device_map is not None and len(self.hf_device_map) > 1
+        if is_pipeline_device_mapped:
+            raise ValueError(
+                "It seems like you have activated a device mapping strategy on the pipeline so calling `enable_model_cpu_offload() isn't allowed. You can call `reset_device_map()` first and then call `enable_model_cpu_offload()`."
+            )
+
+        if self.model_cpu_offload_seq is None:
+            raise ValueError(
+                "Model CPU offload cannot be enabled because no `model_cpu_offload_seq` class attribute is set."
+            )
+
+        if is_accelerate_available() and is_accelerate_version(">=", "0.17.0.dev0"):
+            from accelerate import cpu_offload_with_hook
+        else:
+            raise ImportError("`enable_model_cpu_offload` requires `accelerate v0.17.0` or higher.")
+
+        self.remove_all_hooks()
+
+        torch_device = torch.device(device)
+        device_index = torch_device.index
+
+        if gpu_id is not None and device_index is not None:
+            raise ValueError(
+                f"You have passed both `gpu_id`={gpu_id} and an index as part of the passed device `device`={device}"
+                f"Cannot pass both. Please make sure to either not define `gpu_id` or not pass the index as part of the device: `device`={torch_device.type}"
+            )
+
+        # _offload_gpu_id should be set to passed gpu_id (or id in passed `device`) or default to previously set id or default to 0
+        self._offload_gpu_id = gpu_id or torch_device.index or getattr(self, "_offload_gpu_id", 0)
+
+        device_type = torch_device.type
+        device = torch.device(f"{device_type}:{self._offload_gpu_id}")
+        self._offload_device = device
+
+        self.to("cpu", silence_dtype_warnings=True)
+        device_mod = getattr(torch, device.type, None)
+        if hasattr(device_mod, "empty_cache") and device_mod.is_available():
+            device_mod.empty_cache()  # otherwise we don't see the memory savings (but they probably exist)
+
+        all_model_components = {k: v for k, v in self.components.items() if isinstance(v, torch.nn.Module)}
+
+        self._all_hooks = []
+        hook = None
+        print("self.model_cpu_offload_seq: ", self.model_cpu_offload_seq)
+        print("device: ", device)
+        
+        for model_str in self.model_cpu_offload_seq.split("->"):
+            model = all_model_components.pop(model_str, None)
+
+            if not isinstance(model, torch.nn.Module):
+                continue
+
+            # This is because the model would already be placed on a CUDA device.
+            # _, _, is_loaded_in_8bit_bnb = _check_bnb_status(model)
+            # if is_loaded_in_8bit_bnb:
+            #     logger.info(
+            #         f"Skipping the hook placement for the {model.__class__.__name__} as it is loaded in `bitsandbytes` 8bit."
+            #     )
+            #     continue
+            
+            # _, hook = cpu_offload_with_hook(model, device, prev_module_hook=hook)
+            _, hook = half_cpu_offload_with_hook(model, device)
+            self._all_hooks.append(hook)
+
+        # CPU offload models that are not in the seq chain unless they are explicitly excluded
+        # these models will stay on CPU until maybe_free_model_hooks is called
+        # some models cannot be in the seq chain because they are iteratively called, such as controlnet
+        for name, model in all_model_components.items():
+            if not isinstance(model, torch.nn.Module):
+                continue
+
+            if name in self._exclude_from_cpu_offload:
+                model.to(device)
+            else:
+
+                if is_accelerate_available() and is_accelerate_version(">=", "0.14.0"):
+                    from accelerate import cpu_offload
+                else:
+                    raise ImportError(
+                        "`enable_sequential_cpu_offload` requires `accelerate v0.14.0` or higher"
+                    )
+                
+                if isinstance(model, MultiControlNetModel):
+                    print("hehehehe", len(model.nets))
+                    for idx_net in range(len(model.nets)):
+                        net = model.nets[idx_net]
+                        offload_buffers = len(net._parameters) > 0
+                        cpu_offload(net, device, offload_buffers=offload_buffers)
+                        # _, hook = cpu_offload_with_hook(net, device)
+                        # self._all_hooks.append(hook)
+
+                else:
+                    # _, hook = cpu_offload_with_hook(model, device)
+                    # self._all_hooks.append(hook)
+
+                    offload_buffers = len(model._parameters) > 0
+                    cpu_offload(model, device, offload_buffers=offload_buffers)
+                
 
     @torch.no_grad()
     @replace_example_docstring(EXAMPLE_DOC_STRING)
@@ -1154,7 +1274,7 @@ class StableDiffusionXLInstantIDPipeline(StableDiffusionXLControlNetPipeline):
             image_embeds,
             device,
             num_images_per_prompt,
-            self.unet.dtype,
+            torch.float32,
             self.do_classifier_free_guidance,
         )
 
@@ -1449,6 +1569,7 @@ class StableDiffusionXLInstantIDPipeline(StableDiffusionXLControlNetPipeline):
                     )
 
                 # predict the noise residual
+                # input(f"UNET  {next(self.unet.parameters()).dtype}")
                 noise_pred = self.unet(
                     latent_model_input,
                     t,
@@ -1460,6 +1581,7 @@ class StableDiffusionXLInstantIDPipeline(StableDiffusionXLControlNetPipeline):
                     added_cond_kwargs=added_cond_kwargs,
                     return_dict=False,
                 )[0]
+                print("noise_pred.dtype: ", noise_pred.dtype)
 
                 # perform guidance
                 if self.do_classifier_free_guidance:
@@ -1523,7 +1645,7 @@ class StableDiffusionXLInstantIDPipeline(StableDiffusionXLControlNetPipeline):
             image = self.image_processor.postprocess(image, output_type=output_type)
 
         # Offload all models
-        self.maybe_free_model_hooks()
+        # self.maybe_free_model_hooks()
 
         if not return_dict:
             return (image,)

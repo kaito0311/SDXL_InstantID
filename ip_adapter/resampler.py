@@ -106,6 +106,8 @@ class Resampler(nn.Module):
                     ]
                 )
             )
+        
+        self.dtype = None
 
     def forward(self, x):
         
